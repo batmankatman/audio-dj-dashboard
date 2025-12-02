@@ -1,8 +1,10 @@
-"""Streamlit DJ dashboard for test.wav — TRUE single-page layout.
+"""Streamlit DJ dashboard — TRUE single-page layout.
+Supports uploading custom audio or uses default test.wav.
 Run with: streamlit run streamlit_app.py
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +13,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 import librosa
+import soundfile as sf
 
 AUDIO_PATH = Path(__file__).with_name("test.wav")
 
@@ -35,12 +38,16 @@ html, body, [data-testid="stAppViewContainer"] {
 header[data-testid="stHeader"] { display: none !important; }
 section[data-testid="stSidebar"] {
     background-color: #0a0a0a !important;
-    min-width: 280px !important;
+    min-width: 260px !important;
 }
 section[data-testid="stSidebar"] > div:first-child {
     background-color: #0a0a0a;
-    padding-top: 1rem;
+    padding-top: 0.5rem;
 }
+section[data-testid="stSidebar"] .stSlider { margin-bottom: -0.5rem !important; }
+section[data-testid="stSidebar"] hr { margin: 0.3rem 0 !important; }
+section[data-testid="stSidebar"] .stMarkdown p { margin-bottom: 0.2rem !important; }
+section[data-testid="stSidebar"] .stRadio > div { gap: 0.3rem !important; }
 .stMetric { padding: 0 !important; }
 .stMetric label { font-size: 0.7rem !important; }
 .stMetric [data-testid="stMetricValue"] { font-size: 1rem !important; }
@@ -52,6 +59,13 @@ st.markdown(_COMPACT_CSS, unsafe_allow_html=True)
 @st.cache_data(show_spinner=False)
 def load_audio(path: Path) -> tuple[np.ndarray, int]:
     y, sr = librosa.load(path.as_posix(), sr=None)
+    return y, int(sr)
+
+
+@st.cache_data(show_spinner=False)
+def load_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
+    """Load audio from uploaded bytes."""
+    y, sr = librosa.load(io.BytesIO(data), sr=None)
     return y, int(sr)
 
 
@@ -79,8 +93,30 @@ def quantize(sig: np.ndarray, bits: int) -> np.ndarray:
     return np.clip(q, -1, 1)
 
 
+def audio_to_bytes(audio: np.ndarray, sr: int) -> bytes:
+    """Convert numpy audio to WAV bytes."""
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV")
+    buf.seek(0)
+    return buf.read()
+
+
+COLAB_URL = "https://colab.research.google.com/drive/1ExnXWM44H7iPhesUWytkmcbybl0lTpiM?authuser=1"
+
+
 def main() -> None:
-    y, sr = load_audio(AUDIO_PATH)
+    # ─── Sidebar: Upload + Controls ───
+    with st.sidebar:
+        uploaded = st.file_uploader("📂 Upload audio", type=["wav", "mp3", "ogg", "flac"], label_visibility="collapsed")
+        
+        if uploaded is not None:
+            y, sr = load_audio_bytes(uploaded.getvalue())
+        elif AUDIO_PATH.exists():
+            y, sr = load_audio(AUDIO_PATH)
+        else:
+            st.warning("Upload an audio file")
+            st.stop()
+
     dur = len(y) / sr
     mel_db, mel_t, mel_f = compute_mel(y, sr)
 
@@ -92,51 +128,70 @@ def main() -> None:
 
     # ─── Sidebar controls ───
     with st.sidebar:
-        st.markdown("### 🎛️ Controls")
-        seg_start = st.slider("Segment start (s)", 0.0, max(0.0, dur - 0.02), 1.0, 0.01)
-        seg_dur = st.slider("Segment ms", 5, 500, 50, 5) / 1000
+        st.markdown("---")
+        seg_start = st.slider("Start (s)", 0.0, max(0.0, dur - 0.02), min(1.0, dur - 0.02), 0.01)
+        seg_dur_ms = st.slider("Length (ms)", 5, 500, 50, 5)
+        seg_dur = seg_dur_ms / 1000
         bit_depth = st.slider("Bit depth", 3, 16, 8)
-        alias_rate = st.select_slider("Downsample Hz", [500, 1000, 2000, 4000, 8000, 16000], value=4000)
-
+        alias_rate = st.select_slider("Sample rate", [500, 1000, 2000, 4000, 8000, 16000], value=4000)
         st.markdown("---")
-        st.markdown("### 🔊 Playback")
-        seg_samples = y[int(seg_start * sr):int((seg_start + seg_dur) * sr)]
-        st.audio(seg_samples, sample_rate=sr)
-
-        st.download_button(
-            "CSV export",
-            pd.DataFrame({
-                "t": np.linspace(seg_start, seg_start + seg_dur, int(seg_dur * sr)),
-                "amp": y[int(seg_start * sr):int((seg_start + seg_dur) * sr)][:int(seg_dur * sr)],
-            }).to_csv(index=False).encode(),
-            "segment.csv",
-            "text/csv",
-        )
-
+        
+        # Extract segment
+        start_idx = int(seg_start * sr)
+        end_idx = min(len(y), start_idx + int(seg_dur * sr))
+        seg_samples = y[start_idx:end_idx]
+        
+        # Process: downsample → upsample → quantize
+        if len(seg_samples) > 0:
+            processed = librosa.resample(seg_samples, orig_sr=sr, target_sr=alias_rate)
+            processed = librosa.resample(processed, orig_sr=alias_rate, target_sr=sr)
+            processed = quantize(processed, bit_depth)
+        else:
+            processed = seg_samples
+        
+        # Playback controls
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            playback_mode = st.radio("Audio", ["Original", "Processed"], horizontal=True, label_visibility="collapsed")
+        with col2:
+            loop_enabled = st.checkbox("Loop", value=False)
+        
+        play_audio = seg_samples if playback_mode == "Original" else processed
+        
+        # Use st.audio with a unique key to force refresh on parameter changes
+        if len(play_audio) > 0:
+            audio_bytes = audio_to_bytes(play_audio, sr)
+            # The key forces Streamlit to re-render the widget when parameters change
+            st.audio(audio_bytes, format="audio/wav", loop=loop_enabled)
+        
         st.markdown("---")
-        st.markdown("### 🎭 Mood Estimator")
-        # Compute mood metrics on full track
+        
+        # Mood estimator
         first_diff = np.diff(y)
         movement_metric = float(np.mean(np.abs(first_diff)))
         transient_metric = float(np.mean(np.abs(np.diff(y, n=2))))
-        spectral_centroid = float(librosa.feature.spectral_centroid(y=y, sr=sr).mean())
 
-        calm_votes = sum([
-            movement_metric < 0.001,
-            transient_metric < 0.0005,
-            zcr < 0.05,
-            tempo < 90,
-        ])
+        calm_votes = sum([movement_metric < 0.001, transient_metric < 0.0005, zcr < 0.05, tempo < 90])
         if calm_votes >= 2:
-            mood_label = "😌 Mellow / Sad"
-            mood_color = "#7986cb"
+            mood_label, mood_color = "😌 Mellow", "#7986cb"
         else:
-            mood_label = "🔥 Energetic / Happy"
-            mood_color = "#ffca28"
+            mood_label, mood_color = "🔥 Energetic", "#ffca28"
 
-        st.markdown(f"<div style='text-align:center; padding:8px; background:{mood_color}22; border-radius:6px;'>"
-                    f"<span style='font-size:1.3rem;'>{mood_label}</span></div>", unsafe_allow_html=True)
-        st.caption(f"Movement: {movement_metric:.5f} · Transients: {transient_metric:.6f}")
+        st.markdown(f"<div style='text-align:center;padding:6px;background:{mood_color}22;border-radius:6px;'>"
+                    f"<span style='font-size:1.1rem;'>{mood_label}</span></div>", unsafe_allow_html=True)
+        
+        st.markdown("---")
+        
+        # Links row
+        col_csv, col_colab = st.columns(2)
+        with col_csv:
+            st.download_button(
+                "📊 CSV",
+                pd.DataFrame({"t": np.linspace(seg_start, seg_start + seg_dur, len(seg_samples)), "amp": seg_samples}).to_csv(index=False).encode(),
+                "segment.csv", "text/csv", use_container_width=True
+            )
+        with col_colab:
+            st.link_button("📓 Colab", COLAB_URL, use_container_width=True)
 
     seg_t, seg_v = extract_segment(y, sr, seg_start, seg_dur)
     alias_wave = librosa.resample(seg_v, orig_sr=sr, target_sr=alias_rate)
@@ -145,7 +200,7 @@ def main() -> None:
 
     # ─── Header row: title + stats ───
     hdr = st.columns([3, 1, 1, 1, 1, 1])
-    hdr[0].markdown("###DJ Dashboard")
+    hdr[0].markdown("### DJ Dashboard")
     hdr[1].metric("Dur", f"{dur:.1f}s")
     hdr[2].metric("SR", f"{sr//1000}k")
     hdr[3].metric("RMS", f"{rms:.3f}")
